@@ -2,7 +2,7 @@
   "name": "Pubostinrobot APK Extractor",
   "description": "Telegram bot: APK → AppX tenant entry",
   "keywords": ["telegram", "bot", "apk", "pyrogram"],
-  "stack": "heroku-22",
+  "stack": "heroku-24",
   "buildpacks": [
     { "url": "https://github.com/heroku/heroku-buildpack-apt" },
     { "url": "heroku/python" }
