@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+.venv
+venv
+.env
+*.apk
+*.apks
+*.xapk
+*.apkm
+result.json
