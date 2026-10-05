@@ -70,9 +70,12 @@ def ensure_tools():
     if not os.path.exists(APKEDITOR_JAR):
         _download(APKEDITOR_URL, APKEDITOR_JAR)
 
-    # Set baksmali to use the bundled org.jf.baksmali inside APKEditor.jar
-    extract.set_baksmali(["java", "-cp", APKEDITOR_JAR, "org.jf.baksmali.Main"])
-    logging.info("baksmali: APKEditor.jar (bundled)")
+    # Safely check if extract.py supports set_baksmali before calling it
+    if hasattr(extract, "set_baksmali"):
+        extract.set_baksmali(["java", "-cp", APKEDITOR_JAR, "org.jf.baksmali.Main"])
+        logging.info("baksmali configured: APKEditor.jar (bundled)")
+    else:
+        logging.warning("extract.py does not have a 'set_baksmali' function. Assuming it handles paths internally.")
 
 
 app = Client("apk_extract_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
