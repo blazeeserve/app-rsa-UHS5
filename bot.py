@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
 @Pubostinrobot — APK -> AppX tenant entry.
-
-Send it a .apk / .apks / .xapk / .apkm; it replies with result.json:
-
-  { "_id": "<tenant>api.classx.co.in", "key": "<KEY2 32>", "rsa_key": "-----BEGIN PRIVATE KEY-----…" }
-
-Self-setup: on start it makes sure the local tools exist (java, baksmali, APKEditor.jar)
-and downloads anything missing.
 """
 from __future__ import annotations
 import asyncio, json, logging, os, shutil, subprocess, sys, tempfile, traceback, urllib.request
@@ -36,8 +29,6 @@ API_HASH = os.environ.get("API_HASH", "96ee87847cdfba0a74f229a5a6e655c3")
 BOT_TOKEN = (os.environ.get("BOT_" + "TOKEN") or "").strip()
 APK_EXT = (".apk", ".apks", ".xapk", ".apkm")
 MAX_MB = int(os.environ.get("MAX_APK_MB", "500"))
-
-# Java heap cap — baksmali ko OOM se bachata hai
 JAVA_HEAP = os.environ.get("JAVA_HEAP", "-Xmx700m")
 
 APKEDITOR_URL = os.environ.get(
@@ -64,7 +55,6 @@ def _download(url: str, dest: str) -> bool:
 
 
 def ensure_tools():
-    """Make sure java / APKEditor.jar / baksmali are present; install whatever is missing."""
     if not shutil.which("java"):
         logging.warning("java not found — trying apt-get install default-jre-headless")
         try:
@@ -73,11 +63,9 @@ def ensure_tools():
         except Exception as e:
             logging.error("java install failed: %s", e)
 
-    # APKEditor.jar (also carries a fallback baksmali)
     if not os.path.exists(APKEDITOR_JAR):
         _download(APKEDITOR_URL, APKEDITOR_JAR)
 
-    # baksmali: system -> APKEditor's bundled org.jf.baksmali -> apt libsmali-java
     sys_b = shutil.which("baksmali")
     if sys_b:
         os.environ.setdefault("JAVA_OPTS", JAVA_HEAP)
@@ -113,9 +101,61 @@ def ensure_tools():
 app = Client("apk_extract_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
 
-HELP = """**AppX APK → tenant entry**
+HELP = (
+    "**AppX APK -> tenant entry**\n\n"
+    "Send me an APK (`.apk` / `.apks` / `.xapk` / `.apkm`). "
+    "I reply with **result.json** in the exact tenants.json shape:\n\n"
+    '`{ "_id": "<tenant>api.classx.co.in", "key": "<KEY2 32>", "rsa_key": "PEM" }`\n\n'
+    "• `key`  <- `JavaAESCipher.KEY2` (smali)\n"
+    "• `rsa_key` <- the app's PEM in `assets/`\n"
+    "• `_id`  <- host at the exact `post/userLogin` member, "
+    "canonicalised to `<tenant>api.classx.co.in`"
+)
 
-Send me an APK (`.apk` / `.apks` / `.xapk` / `.apkm`). I reply with **result.json** in the exact tenants.json shape:
 
-```json
-{ "_id": "<tenant>api.classx.co.in", "key": "<KEY2 32>", "rsa_key": "-----BEGIN PRIVATE KEY-----…" }
+def summarize(entry) -> str:
+    return (f"OK **{entry.get('_id') or 'unknown'}**\n"
+            f"• key : `{entry.get('key')}`\n"
+            f"• pem : {len(entry.get('rsa_key') or '')} B")
+
+
+@app.on_message(filters.command("start"))
+async def _start(_, m: Message):
+    await m.reply(HELP)
+
+
+@app.on_message(filters.document)
+async def _apk(_, m: Message):
+    doc = m.document
+    name = (doc.file_name or "").lower()
+    if not name.endswith(APK_EXT):
+        return
+    if doc.file_size and doc.file_size > MAX_MB * 1024 * 1024:
+        await m.reply(f"too big ({doc.file_size/1e6:.0f} MB > {MAX_MB} MB)")
+        return
+    st = await m.reply(f"downloading `{doc.file_name}` ...")
+    tmp = tempfile.mkdtemp(prefix="apkbot_")
+    path = os.path.join(tmp, doc.file_name or "base.apk")
+    try:
+        await m.download(file_name=path)
+        logging.info("job: %s (%s B)", doc.file_name, doc.file_size)
+        await st.edit("extracting ...")
+        res = os.path.join(tmp, "result.json")
+        entry = await asyncio.get_event_loop().run_in_executor(
+            None, run_extract, path, res, None)
+        logging.info("extracted: _id=%s key=%s", entry.get("_id"), entry.get("key"))
+        await m.reply_document(res, caption=summarize(entry))
+        await st.delete()
+    except Exception as e:
+        await st.edit(f"failed: `{e}`")
+        traceback.print_exc()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        sys.exit("set BOT_TOKEN")
+    ensure_tools()
+    logging.info("apk-extract bot starting... (MAX=%sMB, heap=%s)", MAX_MB, JAVA_HEAP)
+    app.run()
