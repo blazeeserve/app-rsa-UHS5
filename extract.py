@@ -68,8 +68,14 @@ def baksmali(dex_bytes: bytes, workdir: str, tag: str):
     src = os.path.join(workdir, f"{tag}.dex")
     out = os.path.join(workdir, f"smali_{tag}")
     open(src, "wb").write(dex_bytes)
-    r = subprocess.run([BAKSMALI, "d", src, "-o", out],
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    
+    # Check if BAKSMALI is a list (like our Java command) or a string
+    if isinstance(BAKSMALI, list):
+        cmd = BAKSMALI + ["d", src, "-o", out]
+    else:
+        cmd = [BAKSMALI, "d", src, "-o", out]
+        
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
     return out if os.path.isdir(out) else None
 
 
