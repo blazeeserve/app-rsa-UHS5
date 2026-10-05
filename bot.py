@@ -25,7 +25,7 @@ API_ID = int(os.environ.get("API_ID", "28985973"))
 API_HASH = os.environ.get("API_HASH", "96ee87847cdfba0a74f229a5a6e655c3")
 BOT_TOKEN = (os.environ.get("BOT_" + "TOKEN") or "").strip()
 APK_EXT = (".apk", ".apks", ".xapk", ".apkm")
-MAX_MB = int(os.environ.get("MAX_APK_MB", "700"))
+MAX_MB = int(os.environ.get("MAX_APK_MB", "500"))
 
 APKEDITOR_URL = os.environ.get(
     "APKEDITOR_URL",
