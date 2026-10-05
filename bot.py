@@ -77,6 +77,7 @@ def ensure_tools():
 
 app = Client("apk_extract_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
+# Using standard string concatenation to prevent Heroku SyntaxError on triple quotes
 HELP = (
     "**AppX APK → tenant entry**\n\n"
     "Send me an APK (`.apk` / `.apks` / `.xapk` / `.apkm`). I reply with **result.json** in the exact tenants.json shape:\n\n"
@@ -87,3 +88,56 @@ HELP = (
     "• `rsa_key` ← the app's PEM in `assets/`\n"
     "• `_id`  ← host at the exact `post/userLogin` member, canonicalised to `<tenant>api.classx.co.in`"
 )
+
+
+def summarize(entry) -> str:
+    return (f"✅ **{entry.get('_id') or 'unknown'}**\n"
+            f"• key : `{entry.get('key')}`\n"
+            f"• pem : {len(entry.get('rsa_key') or '')} B")
+
+
+@app.on_message(filters.command("start"))
+async def _start(_, m: Message):
+    await m.reply(HELP)
+
+
+@app.on_message(filters.document)
+async def _apk(_, m: Message):
+    doc = m.document
+    name = (doc.file_name or "").lower()
+    if not name.endswith(APK_EXT):
+        return
+    
+    if doc.file_size and doc.file_size > MAX_MB * 1024 * 1024:
+        await m.reply(f"⚠️ too big ({doc.file_size/1e6:.0f} MB > {MAX_MB} MB)")
+        return
+        
+    st = await m.reply(f"📥 downloading `{doc.file_name}` …")
+    tmp = tempfile.mkdtemp(prefix="apkbot_")
+    path = os.path.join(tmp, doc.file_name or "base.apk")
+    
+    try:
+        await m.download(file_name=path)
+        logging.info("job: %s (%s B)", doc.file_name, doc.file_size)
+        await st.edit("🔍 extracting …")
+        
+        res = os.path.join(tmp, "result.json")
+        entry = await asyncio.get_event_loop().run_in_executor(None, run_extract, path, res, None)
+        
+        logging.info("extracted: _id=%s key=%s", entry.get("_id"), entry.get("key"))
+        await m.reply_document(res, caption=summarize(entry))
+        await st.delete()
+        
+    except Exception as e:
+        await st.edit(f"❌ failed: `{e}`")
+        traceback.print_exc()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        sys.exit("Error: BOT_TOKEN is missing. Please set it in app.json or Heroku environment variables.")
+    ensure_tools()
+    logging.info("apk-extract bot starting…")
+    app.run()
