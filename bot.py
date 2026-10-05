@@ -29,7 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 API_ID = int(os.environ.get("API_ID", "28985973"))
 API_HASH = os.environ.get("API_HASH", "96ee87847cdfba0a74f229a5a6e655c3")
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
-LOG_CHAT_ID = (os.environ.get("LOG_CHAT_ID") or "").strip() # New Log Chat ID
+LOG_CHAT_ID = (os.environ.get("LOG_CHAT_ID") or "").strip()
 APK_EXT = (".apk", ".apks", ".xapk", ".apkm")
 MAX_MB = int(os.environ.get("MAX_APK_MB", "700"))
 
@@ -71,6 +71,35 @@ def ensure_tools():
         logging.info("baksmali configured: APKEditor.jar (bundled)")
     else:
         logging.warning("extract.py does not have a 'set_baksmali' function. Assuming it handles paths internally.")
+
+
+def _sync_peer_http(bot_token: str, channel_id: str):
+    """Synchronous HTTP call to force peer caching on Telegram's backend."""
+    try:
+        ping_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = json.dumps({
+            "chat_id": channel_id,
+            "text": "🔄 _Syncing server memory..._",
+            "disable_notification": True
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(ping_url, data=payload, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            r = json.loads(response.read().decode())
+            if r.get("ok"):
+                msg_id = r["result"]["message_id"]
+                del_url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
+                del_payload = json.dumps({"chat_id": channel_id, "message_id": msg_id}).encode("utf-8")
+                del_req = urllib.request.Request(del_url, data=del_payload, headers={'Content-Type': 'application/json'})
+                urllib.request.urlopen(del_req, timeout=10)
+    except Exception as e:
+        logging.error(f"Peer Sync Error: {e}")
+
+
+async def ensure_peer_id(bot_token: str, channel_id: str):
+    """Executes the HTTP sync in a background thread to prevent blocking Pyrogram."""
+    await asyncio.get_event_loop().run_in_executor(None, _sync_peer_http, bot_token, channel_id)
+    await asyncio.sleep(1.5)  # Wait for the incoming MTProto update to populate Pyrogram's cache
 
 
 app = Client("apk_extract_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
@@ -117,20 +146,24 @@ async def _apk(_, m: Message):
         
         logging.info("extracted: _id=%s key=%s", entry.get("_id"), entry.get("key"))
         
-        # 1. Send the actual JSON file and summary to the Log Channel (if configured)
+        # Log to the specified Chat ID
         if LOG_CHAT_ID:
+            user_info = f"{m.from_user.first_name} (`{m.from_user.id}`)" if m.from_user else "Unknown"
+            caption = f"📄 **File:** `{doc.file_name}`\n👤 **User:** {user_info}\n\n{summarize(entry)}"
             try:
-                user_info = f"{m.from_user.first_name} (`{m.from_user.id}`)" if m.from_user else "Unknown"
-                caption = f"📄 **File:** `{doc.file_name}`\n👤 **User:** {user_info}\n\n{summarize(entry)}"
                 await app.send_document(chat_id=int(LOG_CHAT_ID), document=res, caption=caption)
             except Exception as log_err:
-                logging.error(f"Failed to send to log chat: {log_err}")
+                if "Peer id invalid" in str(log_err) or "PEER_ID_INVALID" in str(log_err):
+                    logging.info("Peer ID not cached. Triggering HTTP sync fallback...")
+                    await ensure_peer_id(BOT_TOKEN, LOG_CHAT_ID)
+                    # Retry sending after the cache is updated
+                    await app.send_document(chat_id=int(LOG_CHAT_ID), document=res, caption=caption)
+                else:
+                    logging.error(f"Failed to send to log chat: {log_err}")
 
-        # 2. Send only a simple success message to the user
         await st.edit("✅ **Extraction Successful!**")
         
     except Exception as e:
-        # Send simple fail message to the user
         await st.edit("❌ **Extraction Failed.**")
         traceback.print_exc()
     finally:
