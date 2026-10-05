@@ -1,33 +1,17 @@
 {
   "name": "Pubostinrobot APK Extractor",
-  "description": "Telegram bot: APK → AppX tenant entry (result.json)",
+  "description": "Telegram bot: APK → AppX tenant entry",
   "keywords": ["telegram", "bot", "apk", "pyrogram"],
   "stack": "heroku-22",
   "buildpacks": [
     { "url": "https://github.com/heroku/heroku-buildpack-apt" },
-    { "url": "https://github.com/heroku/heroku-buildpack-java" },
     { "url": "heroku/python" }
   ],
   "env": {
-    "BOT_TOKEN": {
-      "description": "8959657669:AAEOTerFMBPkX_lNIYrmfff10EwJYMptAMA",
-      "required": true
-    },
-    "API_ID": {
-      "description": "Telegram API ID",
-      "value": "28985973",
-      "required": false
-    },
-    "API_HASH": {
-      "description": "Telegram API HASH",
-      "value": "96ee87847cdfba0a74f229a5a6e655c3",
-      "required": false
-    },
-    "MAX_APK_MB": {
-      "description": "Max APK size in MB (Heroku 512MB dyno -> keep <=300)",
-      "value": "300",
-      "required": false
-    }
+    "BOT_TOKEN": { "description": "Telegram BotFather token", "required": true },
+    "API_ID":    { "description": "Telegram API ID", "value": "28985973" },
+    "API_HASH":  { "description": "Telegram API HASH", "value": "96ee87847cdfba0a74f229a5a6e655c3" },
+    "MAX_APK_MB":{ "description": "Max APK size MB", "value": "300" }
   },
   "formation": {
     "worker": { "quantity": 1, "size": "basic" }
