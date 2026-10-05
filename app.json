@@ -8,7 +8,7 @@
     { "url": "heroku/python" }
   ],
   "env": {
-    "BOT_TOKEN": { "description": "Telegram BotFather token", "required": true },
+    "BOT_TOKEN": { "description": "Telegram BotFather token", "8959657669:AAEOTerFMBPkX_lNIYrmfff10EwJYMptAMA": true },
     "API_ID":    { "description": "Telegram API ID", "value": "28985973" },
     "API_HASH":  { "description": "Telegram API HASH", "value": "96ee87847cdfba0a74f229a5a6e655c3" },
     "MAX_APK_MB":{ "description": "Max APK size MB", "value": "300" }
