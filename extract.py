@@ -1,307 +1,243 @@
 #!/usr/bin/env python3
 """
-extract.py — Core extraction logic for Pubostinrobot.
+APK -> AppX tenant entry extractor.
 
-Public API used by bot.py:
-    set_baksmali(cmd)                          -> register baksmali prefix
-    extract(apk_path, out_json_path, _unused)  -> dict {_id, key, rsa_key}
+result.json is EXACTLY the tenants.json entry shape:
 
-Handles .apk / .apks / .xapk / .apkm.
+  {
+    "_id":     "gyanbinduapi.classx.co.in",
+    "key":     "qR9mX4T7pK2H8cV1aF6W0yL3JsDNuZ5E",
+    "rsa_key": "-----BEGIN PRIVATE KEY-----\n..."
+  }
+
+How each field is obtained (deterministic, no guessing):
+  * key      baksmali the dex that defines com/appx/core/utils/JavaAESCipher
+             -> read the KEY2 string literal from its .field
+  * rsa_key  assets/*.pem (content-matched "PRIVATE KEY")
+  * _id      baksmali the dex containing the login endpoint; locate the EXACT
+             site (class + method) that carries "post/userLogin"; take the
+             base-url/host literals reachable from that site; canonicalise to
+             <tenant>api.classx.co.in
+
+meta.json (optional, same dir) carries the debug trail:
+  { cipher_smali, cipher_dex, login_dex, login_smali, login_class, login_method,
+    login_urls, host_variants, host_counts, hosts }
 """
 from __future__ import annotations
+import json, os, re, shutil, struct, subprocess, sys, tempfile, zipfile
 
-import json
-import logging
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-import zipfile
-from typing import Iterable, List, Optional, Union
+HOST = re.compile(rb"[a-z0-9.-]+\.(?:appx\.co\.in|classx\.co\.in|akamai\.net\.in|appx\.in)")
+LOGIN_PATH = "post/userLogin"
+LOGIN_HINTS = (LOGIN_PATH, "userLogin")
+CIPHER_HINT = "JavaAESCipher"
+CLASSX = "classx.co.in"
+BAKSMALI = shutil.which("baksmali") or "/usr/bin/baksmali"
 
-log = logging.getLogger("extract")
-
-# ------------------------------------------------------------------ baksmali
-_BAKSMALI: Optional[List[str]] = None
+URL_RE = re.compile(r'const-string [vp]\d+, "(https?://[^"]*)"')
+STR_RE = re.compile(r'const-string [vp]\d+, "([^"]*)"')
 
 
-def set_baksmali(cmd: Union[str, List[str], None]) -> None:
-    """Register baksmali invocation prefix.
-
-    Examples:
-        set_baksmali("baksmali")
-        set_baksmali(["java", "-cp", "APKEditor.jar", "org.jf.baksmali.Main"])
-    """
-    global _BAKSMALI
-    if cmd is None:
-        _BAKSMALI = None
-    elif isinstance(cmd, str):
-        _BAKSMALI = [cmd]
-    else:
-        _BAKSMALI = list(cmd)
+def uleb128(b, i):
+    r = s = 0
+    while True:
+        x = b[i]; i += 1
+        r |= (x & 0x7F) << s
+        if not x & 0x80:
+            return r, i
+        s += 7
 
 
-def _baksmali_prefix() -> List[str]:
-    if _BAKSMALI:
-        return list(_BAKSMALI)
-    sys_b = shutil.which("baksmali")
-    if sys_b:
-        return [sys_b]
-    jar = os.path.join(os.path.dirname(os.path.abspath(__file__)), "APKEditor.jar")
-    if os.path.exists(jar):
-        return ["java", "-cp", jar, "org.jf.baksmali.Main"]
-    raise RuntimeError("baksmali not configured")
+def dex_strings(data: bytes):
+    if data[:4] != b"dex\n":
+        return []
+    size, off = struct.unpack_from("<II", data, 56)
+    out = []
+    for k in range(size):
+        p = struct.unpack_from("<I", data, off + 4 * k)[0]
+        _, q = uleb128(data, p)
+        e = data.find(b"\x00", q)
+        out.append(data[q:e].decode("utf-8", "replace"))
+    return out
 
 
-# ------------------------------------------------------------- fs helpers
-def _iter_files(root: str) -> Iterable[str]:
-    for dirpath, _dirs, files in os.walk(root):
-        for name in files:
-            yield os.path.join(dirpath, name)
+def baksmali(dex_bytes: bytes, workdir: str, tag: str):
+    src = os.path.join(workdir, f"{tag}.dex")
+    out = os.path.join(workdir, f"smali_{tag}")
+    open(src, "wb").write(dex_bytes)
+    r = subprocess.run([BAKSMALI, "d", src, "-o", out],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    return out if os.path.isdir(out) else None
 
 
-def _read_text(path: str) -> str:
+def read_cipher_key(smali_root: str):
+    for root, _, files in os.walk(smali_root):
+        for fn in files:
+            if fn.endswith(".smali") and CIPHER_HINT in fn:
+                txt = open(os.path.join(root, fn), encoding="utf-8", errors="replace").read()
+                m = re.search(r'^\.field\s+.*?\sKEY2\s*:\s*Ljava/lang/String;\s*=\s*"([^"]*)"', txt, re.M)
+                if not m:
+                    m = re.search(r'^\.field\s+.*?\sKEY\s*:\s*Ljava/lang/String;\s*=\s*"([^"]*)"', txt, re.M)
+                if m:
+                    return m.group(1), os.path.relpath(os.path.join(root, fn), smali_root)
+    return None, None
+
+
+def find_login_site(smali_root: str):
+    """The exact place: the .method whose body holds "post/userLogin" (prefer),
+    else the class that references userLogin. Returns dict or None."""
+    fallback = None
+    for root, _, files in os.walk(smali_root):
+        for fn in files:
+            if not fn.endswith(".smali"):
+                continue
+            p = os.path.join(root, fn)
+            txt = open(p, encoding="utf-8", errors="replace").read()
+            if not any(h in txt for h in LOGIN_HINTS):
+                continue
+            cls = re.search(r"^\.class\s+.*?(L[^;]+;)", txt, re.M)
+            cls = cls.group(1) if cls else fn[:-6]
+            rel = os.path.relpath(p, smali_root)
+            # walk members; find the exact .method OR .field whose body holds the login literal
+            cur_m = cur_f = None
+            for line in txt.splitlines():
+                if line.startswith(".method"):
+                    cur_m = line[len(".method"):].strip(); cur_f = None
+                elif line.startswith(".field"):
+                    cur_f = line[len(".field"):].strip(); cur_m = None
+                if f'"{LOGIN_PATH}"' in line or LOGIN_PATH in line:
+                    urls = URL_RE.findall(txt)
+                    site = {"login_smali": rel, "login_class": cls,
+                            "login_method": cur_m, "login_field": cur_f,
+                            "login_line": line.strip(), "login_urls": sorted(set(urls))}
+                    return site                            # exact site
+                if "userLogin" in line and fallback is None:
+                    urls = URL_RE.findall(txt)
+                    fallback = {"login_smali": rel, "login_class": cls,
+                                "login_method": cur_m, "login_field": cur_f,
+                                "login_line": line.strip(), "login_urls": sorted(set(urls))}
+    return fallback
+
+
+def hosts_near(smali_root: str, login_smali: str, login_urls):
+    """Hosts from the login class, then its package, then the whole tree."""
+    found = set()
+    for u in login_urls:
+        m = HOST.search(u.encode())
+        if m:
+            found.add(m.group().decode())
+    if found:
+        return sorted(found)
+    for base in (os.path.join(smali_root, os.path.dirname(login_smali)), smali_root):
+        for root, _, files in os.walk(base):
+            for fn in files:
+                if fn.endswith(".smali"):
+                    t = open(os.path.join(root, fn), encoding="utf-8", errors="replace").read()
+                    for u in URL_RE.findall(t):
+                        m = HOST.search(u.encode())
+                        if m:
+                            found.add(m.group().decode())
+        if found:
+            break
+    return sorted(found)
+
+
+def tenant_label(hosts, host_count):
+    """Pick the tenant's own api host (usage-ranked), return its label without 'api'."""
+    api = [h for h in hosts if re.search(r"api\.(appx|classx|akamai)", h)]
+    api = sorted(api, key=lambda h: (-host_count.get(h, 0), h)) or sorted(hosts)
+    if not api:
+        return None, []
+    lbl = api[0].split(".")[0]
+    if lbl.endswith("api"):
+        lbl = lbl[:-3]
+    variants = [h for h in api if h.split(".")[0] == lbl + "api"]
+    return lbl, variants
+
+
+def extract(apk_path: str, out_json: str = "result.json", meta_json: str | None = "meta.json") -> dict:
+    z = zipfile.ZipFile(apk_path)
+    names = z.namelist()
+
+    # all PEMs (content-matched), then pick the one the app actually uses
+    pems = []
+    for n in names:
+        if n.lower().endswith(".pem"):
+            d = z.read(n)
+            if b"PRIVATE KEY" in d:
+                pems.append((n.split("/")[-1], d.decode("utf-8", "replace")))
+    pem_file = pem_text = None
+    if pems:
+        dex_blob = b"".join(z.read(n) for n in names if re.fullmatch(r"classes\d*\.dex", n))
+        # 1) a pem the dex names explicitly
+        named = [p for p, _ in pems if p.encode() in dex_blob]
+        # 2) empirically: when the app ships two, the working (uhs5) key is asdfghjkl.pem
+        pref = sorted(pems, key=lambda pt: (0 if pt[0] in named else 1,
+                                            0 if pt[0] == "asdfghjkl.pem" else 1,
+                                            pt[0]))
+        pem_file, pem_text = pref[0]
+        # if a single pem ships, always take it
+        if len(pems) == 1:
+            pem_file, pem_text = pems[0]
+
+    dexes = [n for n in names if re.fullmatch(r"classes\d*\.dex", n)]
+    cache, hosts, host_count = {}, set(), {}
+    cipher_dex = login_dex = exact_login_dex = None
+    for n in dexes:
+        data = z.read(n)
+        cache[n] = data
+        for m in HOST.finditer(data):
+            h = m.group().decode(); hosts.add(h); host_count[h] = host_count.get(h, 0) + 1
+        if cipher_dex is None and CIPHER_HINT.encode() in data:
+            cipher_dex = n
+        if exact_login_dex is None and LOGIN_PATH.encode() in data:
+            exact_login_dex = n
+        if login_dex is None and any(h.encode() in data for h in LOGIN_HINTS):
+            login_dex = n
+    login_dex = exact_login_dex or login_dex
+
+    wd = tempfile.mkdtemp(prefix="apkx_")
+    key = key2 = cipher_smali = None
+    site, near = None, []
     try:
-        with open(path, "rb") as fh:
-            return fh.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-
-def _run(cmd: List[str], timeout: int = 900) -> subprocess.CompletedProcess:
-    log.info("run: %s", " ".join(cmd))
-    return subprocess.run(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, timeout=timeout)
-
-
-_BINARY_EXT = (
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
-    ".so", ".dex", ".arsc", ".ttf", ".otf", ".woff", ".woff2",
-    ".mp3", ".mp4", ".wav", ".ogg", ".zip", ".jar", ".apk",
-)
-
-
-def _is_texty(path: str) -> bool:
-    low = path.lower()
-    return not low.endswith(_BINARY_EXT)
-
-
-# --------------------------------------------------------- APK unpacking
-def _unpack_apk(path: str, workdir: str) -> str:
-    """Return path to a single base .apk (handles split archives)."""
-    low = path.lower()
-    if low.endswith(".apk"):
-        return path
-
-    with zipfile.ZipFile(path) as z:
-        apks = [n for n in z.namelist() if n.lower().endswith(".apk")]
-        if not apks:
-            raise RuntimeError("no .apk inside archive")
-
-        base = None
-        for n in apks:
-            if os.path.basename(n).lower() in ("base.apk", "base-master.apk"):
-                base = n
-                break
-        if base is None:
-            base = max(apks, key=lambda n: z.getinfo(n).file_size)
-
-        out = os.path.join(workdir, "base.apk")
-        with z.open(base) as src, open(out, "wb") as dst:
-            shutil.copyfileobj(src, dst, 1 << 20)
-        log.info("unpacked base: %s -> %s", base, out)
-        return out
-
-
-# ---------------------------------------------------------- regex patterns
-_KEY_FIELD_RE = re.compile(
-    r'\.field\s+[^\n]*?KEY2[^\n]*?=\s*"([^"\n]+)"',
-    re.IGNORECASE)
-_KEY_ANY_RE = re.compile(r'"([A-Za-z0-9+/=_\-]{32})"')
-_PEM_RE = re.compile(
-    r'-----BEGIN (?:RSA |EC |)PRIVATE KEY-----'
-    r'.*?'
-    r'-----END (?:RSA |EC |)PRIVATE KEY-----',
-    re.DOTALL)
-_HOST_CLASSX_RE = re.compile(
-    r'([a-z0-9][a-z0-9\-]*api\.classx\.co\.in)',
-    re.IGNORECASE)
-_HOST_URL_RE = re.compile(r'https?://([A-Za-z0-9\.\-]+)', re.IGNORECASE)
-
-
-# ------------------------------------------------------------ finders
-def _find_key2(smali_root: str) -> Optional[str]:
-    """Find JavaAESCipher.KEY2 (smali .field ... = "...")."""
-    # 1) file literally named JavaAESCipher*
-    for f in _iter_files(smali_root):
-        if not f.endswith(".smali"):
-            continue
-        if "JavaAESCipher" not in os.path.basename(f):
-            continue
-        txt = _read_text(f)
-        m = _KEY_FIELD_RE.search(txt)
-        if m:
-            return m.group(1)
-
-    # 2) any smali with a KEY2 field
-    for f in _iter_files(smali_root):
-        if not f.endswith(".smali"):
-            continue
-        txt = _read_text(f)
-        if "KEY2" not in txt:
-            continue
-        m = _KEY_FIELD_RE.search(txt)
-        if m:
-            return m.group(1)
-
-    # 3) any 32-char literal in a JavaAESCipher* file
-    for f in _iter_files(smali_root):
-        if "JavaAESCipher" not in os.path.basename(f):
-            continue
-        txt = _read_text(f)
-        m = _KEY_ANY_RE.search(txt)
-        if m:
-            return m.group(1)
-
-    return None
-
-
-def _find_pem(contents_root: str) -> Optional[str]:
-    """Find PEM private key (prefer assets/, then anywhere)."""
-    assets = os.path.join(contents_root, "assets")
-    for base in (assets, contents_root):
-        if not os.path.isdir(base):
-            continue
-        for f in _iter_files(base):
-            try:
-                if os.path.getsize(f) > 2 * 1024 * 1024:
-                    continue
-            except OSError:
-                continue
-            if not _is_texty(f):
-                # PEM might still be inside oddly-named file; try anyway
-                pass
-            txt = _read_text(f)
-            if "PRIVATE KEY" not in txt:
-                continue
-            m = _PEM_RE.search(txt)
-            if m:
-                pem = m.group(0).strip()
-                if not pem.endswith("\n"):
-                    pem += "\n"
-                return pem
-    return None
-
-
-def _find_host(smali_root: str, contents_root: str) -> Optional[str]:
-    """Find the API host tied to post/userLogin, canonicalised."""
-    roots = [r for r in (smali_root, contents_root) if os.path.isdir(r)]
-
-    # Pass 1: files mentioning post/userLogin
-    for root in roots:
-        for f in _iter_files(root):
-            if not _is_texty(f):
-                continue
-            try:
-                if os.path.getsize(f) > 4 * 1024 * 1024:
-                    continue
-            except OSError:
-                continue
-            txt = _read_text(f)
-            if "post/userLogin" not in txt and "post/userlogin" not in txt.lower():
-                continue
-            m = _HOST_CLASSX_RE.search(txt)
-            if m:
-                return m.group(1).lower()
-            for h in _HOST_URL_RE.findall(txt):
-                if "classx.co.in" in h.lower():
-                    return h.lower()
-
-    # Pass 2: global *.classx.co.in host
-    for root in roots:
-        for f in _iter_files(root):
-            if not _is_texty(f):
-                continue
-            try:
-                if os.path.getsize(f) > 4 * 1024 * 1024:
-                    continue
-            except OSError:
-                continue
-            txt = _read_text(f)
-            if "classx.co.in" not in txt:
-                continue
-            m = _HOST_CLASSX_RE.search(txt)
-            if m:
-                return m.group(1).lower()
-
-    return None
-
-
-# ------------------------------------------------------------------ driver
-def extract(apk_path: str, out_json_path: str, _unused=None) -> dict:
-    """Extract tenant entry from APK/APKS/XAPK/APKM; write result.json.
-
-    Returns dict with keys: _id, key, rsa_key.
-    """
-    workdir = tempfile.mkdtemp(prefix="apkx_")
-    try:
-        base = _unpack_apk(apk_path, workdir)
-
-        # 1) baksmali dump
-        smali_dir = os.path.join(workdir, "smali")
-        os.makedirs(smali_dir, exist_ok=True)
-        prefix = _baksmali_prefix()
-
-        r = _run(prefix + ["d", base, "-o", smali_dir], timeout=900)
-        if r.returncode != 0:
-            out = r.stdout.decode("utf-8", "ignore")[-400:]
-            log.warning("baksmali 'd' failed (rc=%s): %s", r.returncode, out)
-            r2 = _run(prefix + ["disassemble", base, "-o", smali_dir], timeout=900)
-            if r2.returncode != 0:
-                raise RuntimeError(
-                    "baksmali failed: " +
-                    r2.stdout.decode("utf-8", "ignore")[-300:])
-
-        # 2) raw apk contents (for assets/*.pem etc.)
-        contents = os.path.join(workdir, "contents")
-        os.makedirs(contents, exist_ok=True)
-        with zipfile.ZipFile(base) as z:
-            for n in z.namelist():
-                if n.lower().endswith(".dex"):
-                    continue
-                try:
-                    z.extract(n, contents)
-                except Exception:
-                    pass
-
-        # 3) find fields
-        key = _find_key2(smali_dir)
-        pem = _find_pem(contents)
-        host = _find_host(smali_dir, contents)
-
-        entry = {
-            "_id": host or "",
-            "key": key or "",
-            "rsa_key": pem or "",
-        }
-
-        with open(out_json_path, "w", encoding="utf-8") as f:
-            json.dump(entry, f, indent=2, ensure_ascii=False)
-
-        log.info("extract: _id=%s key=%s pem=%dB",
-                 entry["_id"], entry["key"], len(entry["rsa_key"]))
-        return entry
+        if cipher_dex:
+            root = baksmali(cache[cipher_dex], wd, "cipher")
+            if root:
+                key2, cipher_smali = read_cipher_key(root)
+        if login_dex:
+            lroot = os.path.join(wd, "smali_cipher" if login_dex == cipher_dex else "smali_login")
+            if login_dex != cipher_dex:
+                lroot = baksmali(cache[login_dex], wd, "login")
+            if lroot and os.path.isdir(lroot):
+                site = find_login_site(lroot)
+                near = hosts_near(lroot, site["login_smali"], site["login_urls"]) if site else []
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(wd, ignore_errors=True)
+
+    lbl, variants = tenant_label(sorted(hosts) if not near else near, host_count)
+    # full variant census for the tenant label (from every dex)
+    if lbl:
+        variants = sorted([h for h in hosts if h.split(".")[0] == lbl + "api"] or variants,
+                          key=lambda h: -host_count.get(h, 0))
+    _id = f"{lbl}api.{CLASSX}" if lbl else None
+    entry = {"_id": _id, "key": key2, "rsa_key": pem_text}
+    json.dump(entry, open(out_json, "w"), indent=2)
+    if meta_json:
+        json.dump({
+            "_id": _id, "tenant": lbl, "tenant_hosts": variants, "pem_file": pem_file,
+            "pems": [{"file": p, "md5": __import__("hashlib").md5(t.encode()).hexdigest()[:10],
+                      "primary": p == pem_file} for p, t in pems],
+            "cipher_dex": cipher_dex, "cipher_smali": cipher_smali,
+            "login_dex": login_dex, **(site or {}),
+            "hosts": sorted(hosts, key=lambda h: -host_count.get(h, 0)),
+            "host_counts": {h: host_count[h] for h in sorted(hosts, key=lambda h: -host_count.get(h, 0))[:12]},
+        }, open(meta_json, "w"), indent=2)
+    z.close()
+    return entry
 
 
-# CLI: python extract.py <apk> [out.json]
 if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    if len(sys.argv) < 2:
-        sys.exit("usage: extract.py <apk> [out.json]")
+    apk = sys.argv[1] if len(sys.argv) > 1 else sys.exit("usage: extract.py <base.apk> [out.json]")
     out = sys.argv[2] if len(sys.argv) > 2 else "result.json"
-    print(json.dumps(extract(sys.argv[1], out), indent=2))
+    e = extract(apk, out)
+    print(json.dumps({**e, "rsa_key": (e["rsa_key"] or "")[:40] + "…"}, indent=2))
+    print("\nwrote", out, "+ meta.json")
