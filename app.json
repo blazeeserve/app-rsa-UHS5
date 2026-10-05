@@ -14,7 +14,7 @@
     "BOT_TOKEN": {
       "description": "Your Telegram Bot Token",
       "value": "8959657669:AAEOTerFMBPkX_lNIYrmfff10EwJYMptAMA"
-    }
+    },
     "LOG_CHAT_ID": {
       "description": "Your Chat ID",
       "value": "-1004366008491"
