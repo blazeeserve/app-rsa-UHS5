@@ -77,9 +77,13 @@ def ensure_tools():
 
 app = Client("apk_extract_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
-HELP = """**AppX APK → tenant entry**
-
-Send me an APK (`.apk` / `.apks` / `.xapk` / `.apkm`). I reply with **result.json** in the exact tenants.json shape:
-
-```json
-{ "_id": "<tenant>api.classx.co.in", "key": "<KEY2 32>", "rsa_key": "-----BEGIN PRIVATE KEY-----…" }
+HELP = (
+    "**AppX APK → tenant entry**\n\n"
+    "Send me an APK (`.apk` / `.apks` / `.xapk` / `.apkm`). I reply with **result.json** in the exact tenants.json shape:\n\n"
+    "```json\n"
+    '{ "_id": "<tenant>api.classx.co.in", "key": "<KEY2 32>", "rsa_key": "-----BEGIN PRIVATE KEY-----…" }\n'
+    "```\n\n"
+    "• `key`  ← `JavaAESCipher.KEY2` (smali)\n"
+    "• `rsa_key` ← the app's PEM in `assets/`\n"
+    "• `_id`  ← host at the exact `post/userLogin` member, canonicalised to `<tenant>api.classx.co.in`"
+)
