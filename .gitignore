@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.part
+.venv/
+venv/
+.env
+APKEditor.jar
+*.apk
+*.apks
+*.xapk
+*.apkm
+result.json
