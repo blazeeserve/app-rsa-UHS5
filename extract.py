@@ -33,6 +33,10 @@ CIPHER_HINT = "JavaAESCipher"
 CLASSX = "classx.co.in"
 BAKSMALI = shutil.which("baksmali") or "/usr/bin/baksmali"
 
+def set_baksmali(cmd):
+    global BAKSMALI
+    BAKSMALI = cmd
+
 URL_RE = re.compile(r'const-string [vp]\d+, "(https?://[^"]*)"')
 STR_RE = re.compile(r'const-string [vp]\d+, "([^"]*)"')
 
