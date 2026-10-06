@@ -159,7 +159,23 @@ async def _short(_, m: Message):
             json.dump(merged_data, f, indent=2)
             
         caption = f"✅ **Successfully Merged & Sorted!**\n📦 **Total Apps Added:** `{len(merged_data)}`"
+        
+        # 1. Send to the user who requested it
         await m.reply_document(out_path, caption=caption)
+        
+        # 2. Send the merged file to the Log Chat ID (if configured)
+        if LOG_CHAT_ID:
+            user_info = f"{m.from_user.first_name} (`{m.from_user.id}`)" if m.from_user else "Unknown"
+            log_caption = f"📦 **Merged tenants.json Generated**\n👤 **User:** {user_info}\n📊 **Total Apps in File:** `{len(merged_data)}`"
+            try:
+                await app.send_document(chat_id=int(LOG_CHAT_ID), document=out_path, caption=log_caption)
+            except Exception as log_err:
+                if "Peer id invalid" in str(log_err) or "PEER_ID_INVALID" in str(log_err):
+                    logging.info("Peer ID not cached for merged file. Triggering HTTP sync fallback...")
+                    await ensure_peer_id(BOT_TOKEN, LOG_CHAT_ID)
+                    await app.send_document(chat_id=int(LOG_CHAT_ID), document=out_path, caption=log_caption)
+                else:
+                    logging.error(f"Failed to send merged json to log chat: {log_err}")
         
         # Clear the queue after successful merge
         user_json_queues[uid] = []
@@ -203,7 +219,7 @@ async def _process_json(m: Message):
 async def _process_apk(m: Message):
     doc = m.document
     if doc.file_size and doc.file_size > MAX_MB * 1024 * 1024:
-        await m.reply(f"⚠️ too big ({doc.file_size/1e6:.0f} MB > {MAX_MB} MB)")
+        await m.reply(f"⚠️️ too big ({doc.file_size/1e6:.0f} MB > {MAX_MB} MB)")
         return
         
     st = await m.reply(f"📥 downloading `{doc.file_name}` …")
