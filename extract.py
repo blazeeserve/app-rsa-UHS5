@@ -33,6 +33,10 @@ CIPHER_HINT = "JavaAESCipher"
 CLASSX = "classx.co.in"
 BAKSMALI = shutil.which("baksmali") or "/usr/bin/baksmali"
 
+def set_baksmali(cmd):
+    global BAKSMALI
+    BAKSMALI = cmd
+
 URL_RE = re.compile(r'const-string [vp]\d+, "(https?://[^"]*)"')
 STR_RE = re.compile(r'const-string [vp]\d+, "([^"]*)"')
 
@@ -64,8 +68,13 @@ def baksmali(dex_bytes: bytes, workdir: str, tag: str):
     src = os.path.join(workdir, f"{tag}.dex")
     out = os.path.join(workdir, f"smali_{tag}")
     open(src, "wb").write(dex_bytes)
-    r = subprocess.run([BAKSMALI, "d", src, "-o", out],
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    
+    if isinstance(BAKSMALI, list):
+        cmd = BAKSMALI + ["d", src, "-o", out]
+    else:
+        cmd = [BAKSMALI, "d", src, "-o", out]
+        
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
     return out if os.path.isdir(out) else None
 
 
@@ -272,3 +281,4 @@ if __name__ == "__main__":
     e = extract(apk, out)
     print(json.dumps({**e, "rsa_key": (e["rsa_key"] or "")[:40] + "…"}, indent=2))
     print("\nwrote", out, "+ meta.json")
+  
