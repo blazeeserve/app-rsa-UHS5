@@ -4,6 +4,7 @@
 
 Send it a .apk / .apks / .xapk / .apkm; it replies with a success/fail message.
 The extracted result.json is sent to a specified LOG_CHAT_ID.
+Send .json files and use /short to merge and sort them into tenants.json.
 """
 from __future__ import annotations
 import asyncio
@@ -38,6 +39,9 @@ APKEDITOR_URL = os.environ.get(
     "https://github.com/REAndroid/APKEditor/releases/download/V1.4.9/APKEditor-1.4.9.jar"
 )
 APKEDITOR_JAR = os.path.join(HERE, "APKEditor.jar")
+
+# Memory queue to hold user JSONs before merging
+user_json_queues = {}
 
 
 def _download(url: str, dest: str) -> bool:
@@ -99,14 +103,16 @@ def _sync_peer_http(bot_token: str, channel_id: str):
 async def ensure_peer_id(bot_token: str, channel_id: str):
     """Executes the HTTP sync in a background thread to prevent blocking Pyrogram."""
     await asyncio.get_event_loop().run_in_executor(None, _sync_peer_http, bot_token, channel_id)
-    await asyncio.sleep(1.5)  # Wait for the incoming MTProto update to populate Pyrogram's cache
+    await asyncio.sleep(1.5)
 
 
 app = Client("apk_extract_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 HELP = (
     "**AppX APK → tenant entry**\n\n"
-    "Send me an APK (`.apk` / `.apks` / `.xapk` / `.apkm`). I will extract it and let you know if it was successful."
+    "1️⃣ Send an APK (`.apk`/`.xapk`) to extract it.\n"
+    "2️⃣ Send extracted `.json` files to me.\n"
+    "3️⃣ Use /short to merge and alphabetically sort all sent JSONs into `tenants.json`."
 )
 
 
@@ -121,13 +127,78 @@ async def _start(_, m: Message):
     await m.reply(HELP)
 
 
-@app.on_message(filters.document)
-async def _apk(_, m: Message):
-    doc = m.document
-    name = (doc.file_name or "").lower()
-    if not name.endswith(APK_EXT):
+@app.on_message(filters.command(["short", "sort"]))
+async def _short(_, m: Message):
+    uid = m.from_user.id
+    if uid not in user_json_queues or not user_json_queues[uid]:
+        await m.reply("⚠️ You haven't sent me any JSON files yet. Send some `.json` files, then type /short.")
         return
+
+    st = await m.reply("🔄 Merging and sorting your files...")
     
+    # Deduplicate based on _id
+    merged_data = []
+    seen_ids = set()
+    
+    for item in user_json_queues[uid]:
+        item_id = item.get("_id")
+        if item_id and item_id not in seen_ids:
+            seen_ids.add(item_id)
+            merged_data.append(item)
+        elif not item_id:
+            merged_data.append(item)
+
+    # Sort alphabetically by _id
+    merged_data.sort(key=lambda x: str(x.get("_id", "")).lower())
+    
+    tmp = tempfile.mkdtemp(prefix="apkbot_merge_")
+    out_path = os.path.join(tmp, "tenants.json")
+    
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(merged_data, f, indent=2)
+            
+        caption = f"✅ **Successfully Merged & Sorted!**\n📦 **Total Apps Added:** `{len(merged_data)}`"
+        await m.reply_document(out_path, caption=caption)
+        
+        # Clear the queue after successful merge
+        user_json_queues[uid] = []
+    except Exception as e:
+        await m.reply(f"❌ Error generating tenants.json: `{e}`")
+    finally:
+        await st.delete()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def _process_json(m: Message):
+    uid = m.from_user.id
+    st = await m.reply("📥 Reading JSON...")
+    path = await m.download()
+    
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        if uid not in user_json_queues:
+            user_json_queues[uid] = []
+            
+        # Handle both list formats and single dict formats
+        if isinstance(data, list):
+            user_json_queues[uid].extend(data)
+        elif isinstance(data, dict):
+            user_json_queues[uid].append(data)
+            
+        count = len(user_json_queues[uid])
+        await st.edit(f"✅ JSON added to queue! You now have **{count}** app entries ready.\n\nSend more JSONs, or type /short to merge.")
+    except Exception as e:
+        await st.edit(f"❌ Failed to parse JSON: `{e}`")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+async def _process_apk(m: Message):
+    doc = m.document
     if doc.file_size and doc.file_size > MAX_MB * 1024 * 1024:
         await m.reply(f"⚠️ too big ({doc.file_size/1e6:.0f} MB > {MAX_MB} MB)")
         return
@@ -146,7 +217,6 @@ async def _apk(_, m: Message):
         
         logging.info("extracted: _id=%s key=%s", entry.get("_id"), entry.get("key"))
         
-        # Log to the specified Chat ID
         if LOG_CHAT_ID:
             user_info = f"{m.from_user.first_name} (`{m.from_user.id}`)" if m.from_user else "Unknown"
             caption = f"📄 **File:** `{doc.file_name}`\n👤 **User:** {user_info}\n\n{summarize(entry)}"
@@ -156,7 +226,6 @@ async def _apk(_, m: Message):
                 if "Peer id invalid" in str(log_err) or "PEER_ID_INVALID" in str(log_err):
                     logging.info("Peer ID not cached. Triggering HTTP sync fallback...")
                     await ensure_peer_id(BOT_TOKEN, LOG_CHAT_ID)
-                    # Retry sending after the cache is updated
                     await app.send_document(chat_id=int(LOG_CHAT_ID), document=res, caption=caption)
                 else:
                     logging.error(f"Failed to send to log chat: {log_err}")
@@ -168,6 +237,15 @@ async def _apk(_, m: Message):
         traceback.print_exc()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.on_message(filters.document)
+async def _document_router(_, m: Message):
+    name = (m.document.file_name or "").lower()
+    if name.endswith(APK_EXT):
+        await _process_apk(m)
+    elif name.endswith(".json"):
+        await _process_json(m)
 
 
 if __name__ == "__main__":
