@@ -173,7 +173,10 @@ async def _short(_, m: Message):
 async def _process_json(m: Message):
     uid = m.from_user.id
     st = await m.reply("📥 Reading JSON...")
-    path = await m.download()
+    
+    # Assign a unique file name using the message ID to prevent collisions during simultaneous uploads
+    safe_filename = f"downloads/json_{m.id}_{m.document.file_name or 'file.json'}"
+    path = await m.download(file_name=safe_filename)
     
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -193,7 +196,7 @@ async def _process_json(m: Message):
     except Exception as e:
         await st.edit(f"❌ Failed to parse JSON: `{e}`")
     finally:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             os.remove(path)
 
 
